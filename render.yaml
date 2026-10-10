@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: multiplayer-ai-agent
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: agent-state
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATABASE_PATH
+        value: /var/data/state.sqlite3
+      - key: LLM_PROVIDER
+        value: auto
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: APPROVAL_QUORUM
+        value: "2"
+      - key: APPROVAL_TIMEOUT_SECONDS
+        value: "300"

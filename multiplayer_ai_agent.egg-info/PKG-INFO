@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: multiplayer-ai-agent
+Version: 0.1.0
+Summary: A shared, steerable AI agent runtime with versioned execution state.
+Requires-Python: >=3.9
+Requires-Dist: fastapi<1,>=0.110
+Requires-Dist: uvicorn[standard]<1,>=0.27
+Requires-Dist: httpx<1,>=0.27
+Requires-Dist: redis<7,>=5

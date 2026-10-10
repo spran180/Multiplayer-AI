@@ -1,0 +1,3 @@
+{$DUCKDNS_HOSTNAME} {
+	reverse_proxy agent-api:8000
+}

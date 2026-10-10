@@ -1,0 +1,111 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "multiplayer-ai-agent/envelope",
+  "title": "Multiplayer AI Agent wire envelope",
+  "description": "Every WebSocket frame is an object of this shape. `type` discriminates; `payload` shape depends on `type`.",
+  "type": "object",
+  "required": ["v", "type", "id", "ts"],
+  "properties": {
+    "v": { "const": 1 },
+    "type": { "$ref": "#/definitions/MessageKind" },
+    "id": { "type": "string", "minLength": 1 },
+    "room_id": { "type": "string" },
+    "seq": { "type": "integer", "minimum": 0 },
+    "ts": { "type": "number" },
+    "sender": { "type": "string" },
+    "reply_to": { "type": ["string", "null"] },
+    "correlation_id": { "type": ["string", "null"] },
+    "payload": { "type": "object" }
+  },
+  "definitions": {
+    "MessageKind": {
+      "type": "string",
+      "enum": [
+        "rpc", "rpc.response",
+        "agent.started", "agent.thought", "agent.tool_call", "agent.tool_result",
+        "agent.step", "agent.done", "agent.error",
+        "state.node_added", "state.snapshot", "state.branch", "state.merge",
+        "room.presence",
+        "steering.status", "steering.lock_changed", "approval.requested", "approval.updated"
+      ]
+    },
+    "RunState": {
+      "type": "string",
+      "enum": ["idle", "running", "paused", "interrupted", "finished", "failed"]
+    },
+    "SteeringAction": {
+      "type": "string",
+      "enum": ["pause", "resume", "interrupt", "inject"]
+    },
+    "UserRole": {
+      "type": "string",
+      "enum": ["viewer", "operator", "steerer"]
+    },
+    "User": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "role": { "$ref": "#/definitions/UserRole" }
+      }
+    },
+    "Presence": {
+      "type": "object",
+      "required": ["user"],
+      "properties": {
+        "user": { "$ref": "#/definitions/User" },
+        "connected_at": { "type": "number" },
+        "is_host": { "type": "boolean" }
+      }
+    },
+    "MemoryEntry": {
+      "type": "object",
+      "required": ["kind", "text"],
+      "properties": {
+        "kind": { "type": "string" },
+        "text": { "type": "string" }
+      }
+    },
+    "Snapshot": {
+      "type": "object",
+      "required": ["snapshot_id", "step_index", "run_state", "memory"],
+      "properties": {
+        "snapshot_id": { "type": "string" },
+        "node_id": { "type": "string" },
+        "step_index": { "type": "integer", "minimum": 0 },
+        "run_state": { "$ref": "#/definitions/RunState" },
+        "memory": { "type": "array", "items": { "$ref": "#/definitions/MemoryEntry" } },
+        "scratch": { "type": "object" },
+        "content_hash": { "type": "string" },
+        "created_at": { "type": "number" }
+      }
+    },
+    "GraphNode": {
+      "type": "object",
+      "required": ["node_id", "step_index", "kind"],
+      "properties": {
+        "node_id": { "type": "string" },
+        "room_id": { "type": "string" },
+        "label": { "type": "string" },
+        "parents": { "type": "array", "items": { "type": "string" } },
+        "step_index": { "type": "integer", "minimum": 0 },
+        "kind": { "type": "string", "enum": ["step", "branch", "merge", "root"] },
+        "snapshot_id": { "type": "string" },
+        "created_at": { "type": "number" },
+        "meta": { "type": "object" }
+      }
+    },
+    "SteeringLock": {
+      "type": "object",
+      "required": ["room_id", "token"],
+      "properties": {
+        "room_id": { "type": "string" },
+        "holder_id": { "type": ["string", "null"] },
+        "holder_name": { "type": ["string", "null"] },
+        "token": { "type": "string" },
+        "acquired_at": { "type": "number" }
+      }
+    }
+  }
+}

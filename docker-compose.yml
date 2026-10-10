@@ -1,0 +1,64 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-state:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+  agent-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-auto}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-180}
+      DATABASE_PATH: /app/data/state.sqlite3
+      REDIS_URL: redis://redis:6379/0
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      APPROVAL_QUORUM: ${APPROVAL_QUORUM:-2}
+      APPROVAL_TIMEOUT_SECONDS: ${APPROVAL_TIMEOUT_SECONDS:-300}
+    volumes:
+      - ./frontend/web:/app/frontend/web:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+  duckdns-updater:
+    profiles: ["public"]
+    image: python:3.12-alpine
+    command: ["python", "/app/duckdns_updater.py"]
+    environment:
+      DUCKDNS_SUBDOMAIN: ${DUCKDNS_SUBDOMAIN:-}
+      DUCKDNS_TOKEN: ${DUCKDNS_TOKEN:-}
+    volumes:
+      - ./deploy/duckdns_updater.py:/app/duckdns_updater.py:ro
+    restart: unless-stopped
+  public-proxy:
+    profiles: ["public"]
+    image: caddy:2-alpine
+    environment:
+      DUCKDNS_HOSTNAME: ${DUCKDNS_HOSTNAME:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - agent-api
+    restart: unless-stopped
+
+volumes:
+  redis-state:
+  caddy-data:
+  caddy-config:
