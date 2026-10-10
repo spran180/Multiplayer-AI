@@ -34,6 +34,8 @@ class GroqPlanner(LLMClient):
                     "You are a careful task agent. Return JSON only, with keys thought, "
                     "tool (one of search, calculate, verify, apply_change, finish or null), tool_args, "
                     "finish (boolean), summary, memory_note. Use finish=true when done. "
+                    "For research tasks, use search to gather source URLs and snippets before writing conclusions; "
+                    "search results are evidence, and final summaries should cite their URLs. "
                     "Never claim a tool ran unless requested through tool. Use apply_change "
                     "to propose external side effects; that tool requires human approval." )},
                 {"role": "user", "content": f"Task: {task}\nStep: {step_index}\nMemory:\n{transcript}"},

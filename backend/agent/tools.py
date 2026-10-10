@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 import operator
 from urllib.parse import parse_qs, urlparse
@@ -97,20 +98,107 @@ class _DuckDuckGoResults(HTMLParser):
 
 
 def search_web(query: str, limit: int = 5):
-    """Run a small public web search and return source URLs for the agent."""
+    """Search several public indexes, tolerating an unavailable search provider."""
     import httpx
 
-    response = httpx.get(
-        "https://html.duckduckgo.com/html/",
-        params={"q": query},
-        headers={"User-Agent": "Mozilla/5.0 (compatible; MultiplayerAgent/1.0)"},
-        timeout=12.0,
-        follow_redirects=True,
-    )
-    response.raise_for_status()
-    parser = _DuckDuckGoResults()
-    parser.feed(response.text)
-    results = parser.results[:limit]
+    headers = {"User-Agent": "MultiplayerAgent/1.0 (research assistant)"}
+
+    def duckduckgo():
+        response = httpx.get(
+            "https://html.duckduckgo.com/html/", params={"q": query},
+            headers={**headers, "User-Agent": "Mozilla/5.0 (compatible; MultiplayerAgent/1.0)"},
+            timeout=5.0, follow_redirects=True,
+        )
+        response.raise_for_status()
+        parser = _DuckDuckGoResults()
+        parser.feed(response.text)
+        return parser.results
+
+    def wikipedia():
+        response = httpx.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "query", "list": "search", "srsearch": query,
+                    "format": "json", "utf8": 1, "srlimit": limit},
+            headers=headers, timeout=5.0,
+        )
+        response.raise_for_status()
+        rows = response.json().get("query", {}).get("search", [])
+        return [{"title": row["title"],
+                 "url": "https://en.wikipedia.org/?curid=" + str(row["pageid"]),
+                 "snippet": _plain_text(row.get("snippet", "")),
+                 "source": "Wikipedia"} for row in rows]
+
+    def crossref():
+        response = httpx.get(
+            "https://api.crossref.org/works",
+            params={"query.bibliographic": query, "rows": limit},
+            headers=headers,
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        items = response.json().get("message", {}).get("items", [])
+        results = []
+        for item in items:
+            title = (item.get("title") or [""])[0]
+            if not title:
+                continue
+            authors = ", ".join(
+                " ".join(part for part in (author.get("given"), author.get("family")) if part)
+                for author in item.get("author", [])[:3]
+            )
+            date_parts = (item.get("published", {}) or item.get("created", {})).get("date-parts", [[]])
+            year = str(date_parts[0][0]) if date_parts and date_parts[0] else ""
+            results.append({"title": title, "url": item.get("URL", ""),
+                            "snippet": "; ".join(part for part in (authors, year) if part),
+                            "source": "Crossref"})
+        return results
+
+    sources = (duckduckgo, wikipedia, crossref)
+    collected = []
+    failures = []
+    # Query independent providers concurrently so a slow source cannot delay
+    # usable results from the others. Each request has its own short timeout.
+    pool = ThreadPoolExecutor(max_workers=len(sources))
+    futures = [pool.submit(source) for source in sources]
+    try:
+        for future in as_completed(futures, timeout=7.0):
+            try:
+                collected.extend(future.result())
+            except Exception as exc:
+                failures.append(type(exc).__name__)
+    except TimeoutError:
+        failures.append("provider timeout")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    results = []
+    seen = set()
+    for item in collected:
+        url = item.get("url", "")
+        key = urlparse(url).netloc + urlparse(url).path
+        if url.startswith(("http://", "https://")) and key not in seen:
+            seen.add(key)
+            results.append(item)
+            if len(results) >= limit:
+                break
     if not results:
-        raise RuntimeError("Web search returned no parseable results; the search provider may be unavailable.")
-    return {"query": query, "results": results}
+        detail = ", ".join(failures) or "all providers returned no matches"
+        raise RuntimeError(f"Web search could not reach a public search source ({detail}). Check outbound internet access from the deployed server.")
+    return {"query": query, "results": results, "sources": sorted({item.get("source", "Web") for item in results})}
+
+
+def _plain_text(value: str) -> str:
+    """Remove HTML tags from snippets returned by Wikipedia."""
+    from html import unescape
+    parser = _TextOnly()
+    parser.feed(value)
+    return " ".join(unescape("".join(parser.parts)).split())
+
+
+class _TextOnly(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)

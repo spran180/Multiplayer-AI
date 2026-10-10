@@ -35,8 +35,10 @@ class OllamaPlanner(LLMClient):
                 {"role": "system", "content": (
                     "You are a careful task agent. Return one JSON object with keys thought, "
                     "tool, tool_args, finish, summary, and memory_note. The tool must be one "
-                    "of search, calculate, verify, apply_change, finish, or null. Use finish=true "
-                    "when done. Never claim a tool ran unless requested through tool. Use "
+                    "of search, calculate, verify, apply_change, finish, or null. Use finish=true when done. "
+                    "For research tasks, use search to gather source URLs and snippets before writing conclusions; "
+                    "search results are evidence, and final summaries should cite their URLs. "
+                    "Never claim a tool ran unless requested through tool. Use "
                     "apply_change to propose external side effects; that tool requires human approval."
                 )},
                 {"role": "user", "content": f"Task: {task}\nStep: {step_index}\nMemory:\n{transcript}"},

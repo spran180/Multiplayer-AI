@@ -116,7 +116,11 @@ class AIAgentCore:
                 try:
                     runtime_env = self.room.store.get_runtime_env(self.room.id)
                     resolved_args = _expand_env(decision.tool_args, runtime_env)
-                    result = _redact(run_tool(decision.tool, resolved_args), runtime_env)
+                    # Search and other network-backed tools must not block the
+                    # event loop: room presence, steering, and websocket events
+                    # continue while a tool is waiting on an external service.
+                    tool_result = await asyncio.to_thread(run_tool, decision.tool, resolved_args)
+                    result = _redact(tool_result, runtime_env)
                     memories.append(MemoryEntry(kind="tool", text=f"{decision.tool}: {result}"))
                     self.emit("agent.tool_result", {"tool": decision.tool, "result": result,
                                                      "step_index": step_index})
