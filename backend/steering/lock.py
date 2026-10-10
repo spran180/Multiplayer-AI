@@ -59,6 +59,9 @@ class LockManager:
                 return False
             return True
 
+    def renew(self, token: str, user_id: str) -> bool:
+        return self.holds(token, user_id)
+
     # -- mutations (each a CAS) ----------------------------------------
     def acquire(self, user_id: str, name: Optional[str] = None) -> SteeringLock:
         """Claim steering rights for ``user_id``.
@@ -104,6 +107,8 @@ class LockManager:
 class RedisLockManager:
     """CAS steering lock shared by every API replica for a room."""
 
+    LEASE_SECONDS = 300
+
     _ACQUIRE = """
     local holder = redis.call('HGET', KEYS[1], 'holder_id')
     if holder and holder ~= ARGV[1] then return {0} end
@@ -111,6 +116,7 @@ class RedisLockManager:
     if not holder or holder == '' then token = ARGV[3] end
     redis.call('HSET', KEYS[1], 'holder_id', ARGV[1], 'holder_name', ARGV[2],
         'token', token, 'acquired_at', ARGV[4])
+    redis.call('EXPIRE', KEYS[1], ARGV[5])
     return {1, token, ARGV[4]}
     """
     _RELEASE = """
@@ -124,6 +130,7 @@ class RedisLockManager:
        redis.call('HGET', KEYS[1], 'holder_id') ~= ARGV[2] then return 0 end
     redis.call('HSET', KEYS[1], 'holder_id', ARGV[3], 'holder_name', ARGV[4],
         'token', ARGV[5], 'acquired_at', ARGV[6])
+    redis.call('EXPIRE', KEYS[1], ARGV[7])
     return 1
     """
 
@@ -148,7 +155,8 @@ class RedisLockManager:
 
     def acquire(self, user_id: str, name: Optional[str] = None) -> SteeringLock:
         now = str(time.time())
-        result = self.client.eval(self._ACQUIRE, 1, self.key, user_id, name or "", _new_token(), now)
+        result = self.client.eval(self._ACQUIRE, 1, self.key, user_id, name or "", _new_token(),
+                                  now, self.LEASE_SECONDS)
         if not result or int(result[0]) == 0:
             raise SteeringError("lock_held", "steering is held by another room member")
         return self.current()
@@ -164,8 +172,15 @@ class RedisLockManager:
         if from_id == to_id:
             raise SteeringError("invalid_args", "hand-off target must differ from source")
         result = self.client.eval(self._HANDOFF, 1, self.key, token, from_id, to_id,
-                                  to_name or "", _new_token(), str(time.time()))
+                                  to_name or "", _new_token(), str(time.time()), self.LEASE_SECONDS)
         if not result:
             raise SteeringError("wrong_token", "only the current holder may hand off")
         return self.current()
+
+    def renew(self, token: str, user_id: str) -> bool:
+        return bool(self.client.eval("""
+            if redis.call('HGET', KEYS[1], 'token') ~= ARGV[1] or
+               redis.call('HGET', KEYS[1], 'holder_id') ~= ARGV[2] then return 0 end
+            return redis.call('EXPIRE', KEYS[1], ARGV[3])
+        """, 1, self.key, token, user_id, self.LEASE_SECONDS))
 

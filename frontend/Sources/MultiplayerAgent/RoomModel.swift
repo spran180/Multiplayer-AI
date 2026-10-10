@@ -31,19 +31,61 @@ final class RoomModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var approvalGates: [[String: Any]] = []
     @Published var finalResult: String?
+    @Published var isAuthenticated = false
 
     var baseURL = URL(string: ProcessInfo.processInfo.environment["AGENT_SERVER"] ?? "http://127.0.0.1:8000")!
     private var socket: URLSessionWebSocketTask?
     private var reconnectTask: Task<Void, Never>?
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
-    let userID = UUID().uuidString
-    let userName = Host.current().localizedName ?? "Teammate"
+    var userID = ""
+    var userName = Host.current().localizedName ?? "Teammate"
 
     func refreshRooms() async {
         do {
+            let (authData, authResponse) = try await URLSession.shared.data(from: baseURL.appending(path: "auth/me"))
+            guard (authResponse as? HTTPURLResponse)?.statusCode == 200 else {
+                isAuthenticated = false
+                return
+            }
+            let auth = try JSONSerialization.jsonObject(with: authData) as? [String: Any] ?? [:]
+            let user = auth["user"] as? [String: Any] ?? [:]
+            userID = user["id"] as? String ?? ""
+            userName = user["name"] as? String ?? "Teammate"
+            isAuthenticated = !userID.isEmpty
+            guard isAuthenticated else { return }
             let (data, _) = try await URLSession.shared.data(from: baseURL.appending(path: "rooms"))
             rooms = try JSONDecoder().decode([RoomSummary].self, from: data)
         } catch { errorMessage = error.localizedDescription }
+    }
+
+    func authenticate(email: String, password: String, name: String? = nil) async {
+        do {
+            var request = URLRequest(url: baseURL.appending(path: "auth/\(name == nil ? "login" : "register")"))
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            var body: [String: String] = ["email": email, "password": password]
+            if let name { body["name"] = name }
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                throw NSError(domain: "MultiplayerAuth", code: (response as? HTTPURLResponse)?.statusCode ?? 0,
+                              userInfo: [NSLocalizedDescriptionKey: payload?["detail"] as? String ?? "Sign in failed."])
+            }
+            await refreshRooms()
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func signOut() async {
+        var request = URLRequest(url: baseURL.appending(path: "auth/logout"))
+        request.httpMethod = "POST"
+        _ = try? await URLSession.shared.data(for: request)
+        disconnect()
+        isAuthenticated = false
+        userID = ""
+        userName = "Teammate"
+        rooms = []
+        selectedRoom = nil
     }
 
     func createRoom() async {
@@ -75,8 +117,6 @@ final class RoomModel: ObservableObject {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!
         components.scheme = baseURL.scheme == "https" ? "wss" : "ws"
         components.path = "/ws/\(room.id)"
-        components.queryItems = [URLQueryItem(name: "user_id", value: userID),
-                                 URLQueryItem(name: "name", value: userName)]
         let task = URLSession.shared.webSocketTask(with: components.url!)
         socket = task
         task.resume()
@@ -159,9 +199,20 @@ final class RoomModel: ObservableObject {
 
     func copyInvite() {
         guard let room = selectedRoom else { return }
-        let invite = room.share_url ?? baseURL.appending(path: "r/\(room.id)").absoluteString
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(invite, forType: .string)
+        Task {
+            do {
+                var request = URLRequest(url: baseURL.appending(path: "rooms/\(room.id)/invite"))
+                request.httpMethod = "POST"
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard (response as? HTTPURLResponse)?.statusCode == 200,
+                      let payload = try JSONSerialization.jsonObject(with: data) as? [String: String],
+                      let invite = payload["share_url"] else {
+                    throw URLError(.badServerResponse)
+                }
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(invite, forType: .string)
+            } catch { errorMessage = error.localizedDescription }
+        }
     }
 
     func refreshGraph() async {

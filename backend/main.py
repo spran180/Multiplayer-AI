@@ -8,13 +8,16 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from backend.agent.core import AIAgentCore
+from backend.auth import AuthError, AuthStore
 from backend.agent.llm.groq import GroqPlanner
 from backend.agent.llm.mock import MockPlanner
 from backend.agent.llm.ollama import OllamaPlanner
@@ -61,21 +64,57 @@ class Room:
 if settings.redis_url:
     store = RedisStateStore(settings.redis_url)
     bus = RedisPubSubBus(settings.redis_url)
+    auth_store = AuthStore(settings.redis_url, settings.database_path)
 else:
     Path(settings.database_path).parent.mkdir(parents=True, exist_ok=True)
     store = StateStore(settings.database_path)
     bus = PubSubBus()
+    auth_store = AuthStore(sqlite_path=settings.database_path)
 rooms: dict[str, Room] = {}
 
 
 def _room_info(room: Room) -> dict:
     lock = _safe_lock(room)
     return {"id": room.id, "name": room.name, "created_at": room.created_at,
-            "share_url": f"{settings.public_base_url}/r/{room.id}",
-            "run_state": _run_state(room), "members": store.list_members(room.id),
+            "run_state": _run_state(room), "members": _unique_members(room.id),
             "approval_quorum": settings.approval_quorum,
             "steering_lock": lock, "graph": store.load(room.id).to_dict(),
             "approvals": store.list_approvals(room.id)}
+
+
+def _unique_members(room_id: str) -> list[dict]:
+    members = {}
+    for member in store.list_members(room_id):
+        members[member.get("id")] = {key: value for key, value in member.items()
+                                     if key != "connection_id"}
+    return list(members.values())
+
+
+def _invite_url(room_id: str, user_id: str) -> str:
+    token = auth_store.create_invite(room_id, user_id)
+    return f"{settings.public_base_url}/r/{room_id}?invite={token}"
+
+
+class Credentials(BaseModel):
+    email: str = Field(max_length=254)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class Registration(Credentials):
+    name: str = Field(min_length=1, max_length=80)
+
+
+def require_user(request: Request) -> dict:
+    user = auth_store.get_session_user(request.cookies.get("multiplayer_session"))
+    if not user:
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
+    return user
+
+
+def set_session_cookie(response: Response, token: str):
+    response.set_cookie("multiplayer_session", token, max_age=30 * 86400,
+                        httponly=True, secure=settings.public_base_url.startswith("https://"),
+                        samesite="lax", path="/")
 
 
 def _safe_lock(room: Room) -> dict:
@@ -165,6 +204,7 @@ async def close_services():
     if hasattr(bus, "close"):
         bus.close()
     store.close()
+    auth_store.close()
 
 
 async def broadcast(room: Room, kind: str, payload: dict, sender: str = "agent"):
@@ -207,60 +247,135 @@ def _json_default(value):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": "groq" if settings.groq_api_key else "mock"}
+    return {"ok": True, "model": settings.llm_provider,
+            "coordination": "redis" if settings.redis_url else "single-instance"}
+
+
+@app.post("/auth/register", status_code=201)
+def register_account(body: Registration, response: Response):
+    try:
+        user = auth_store.register(body.email, body.password, body.name)
+    except AuthError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    set_session_cookie(response, auth_store.create_session(user["id"]))
+    return {"user": user}
+
+
+@app.post("/auth/login")
+def login(body: Credentials, response: Response):
+    user = auth_store.authenticate(body.email, body.password)
+    if not user:
+        raise HTTPException(401, "Email or password is incorrect.")
+    set_session_cookie(response, auth_store.create_session(user["id"]))
+    return {"user": user}
+
+
+@app.post("/auth/logout")
+def logout(request: Request, response: Response):
+    auth_store.revoke_session(request.cookies.get("multiplayer_session"))
+    response.delete_cookie("multiplayer_session", path="/", httponly=True,
+                           secure=settings.public_base_url.startswith("https://"), samesite="lax")
+    return {"ok": True}
+
+
+@app.get("/auth/me")
+def who_am_i(user: dict = Depends(require_user)):
+    return {"user": user}
 
 
 @app.get("/rooms")
-def list_rooms():
-    for room_id in store.list_rooms():
-        _restore_room(room_id)
-    return [{"id": room.id, "name": room.name, "run_state": _run_state(room),
-             "member_count": len(store.list_members(room.id)),
-             "share_url": f"{settings.public_base_url}/r/{room.id}"} for room in rooms.values()]
+def list_rooms(user: dict = Depends(require_user)):
+    result = []
+    for room_id in auth_store.room_ids_for_user(user["id"]):
+        try:
+            room = _restore_room(room_id)
+        except KeyError:
+            continue
+        result.append({"id": room.id, "name": room.name, "run_state": _run_state(room),
+                       "member_count": len(_unique_members(room.id))})
+    return result
 
 
 @app.post("/rooms")
-async def create_room(body: Optional[dict] = None):
+async def create_room(body: Optional[dict] = None, user: dict = Depends(require_user)):
     try:
         room = _create_room((body or {}).get("name", "Shared agent room"))
+        invite = auth_store.add_room_owner(room.id, user["id"])
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     _init_room_controls(room)
-    return _room_info(room)
+    return {**_room_info(room),
+            "share_url": f"{settings.public_base_url}/r/{room.id}?invite={invite}"}
 
 
 @app.get("/rooms/{room_id}")
-async def get_room(room_id: str):
+async def get_room(room_id: str, invite: str = Query(default=""), user: dict = Depends(require_user)):
     try:
         room = _restore_room(room_id)
     except KeyError:
         raise HTTPException(404, "room not found")
+    if not auth_store.has_members(room_id):
+        auth_store.claim_legacy_room(room_id, user["id"])
+    if not auth_store.authorize_room(room_id, user["id"], invite):
+        raise HTTPException(403, "You do not have access to this room. Open a valid room invitation.")
     if room.pause_event is None:
         _init_room_controls(room)
-    return _room_info(room)
+    return {**_room_info(room), "share_url": _invite_url(room.id, user["id"])}
 
 
 @app.get("/r/{room_id}", include_in_schema=False)
-async def room_invite(room_id: str):
+async def room_invite(room_id: str, request: Request, invite: str = Query(default="")):
     try:
         room = _restore_room(room_id)
     except KeyError:
         raise HTTPException(404, "room not found")
+    user = auth_store.get_session_user(request.cookies.get("multiplayer_session"))
+    query = f"room={room.id}" + (f"&invite={invite}" if invite else "")
+    if not user:
+        return RedirectResponse(url=f"/app/?{query}")
+    if not auth_store.has_members(room.id):
+        auth_store.claim_legacy_room(room.id, user["id"])
+    if not auth_store.authorize_room(room.id, user["id"], invite):
+        return RedirectResponse(url=f"/app/?{query}")
     return RedirectResponse(url=f"/app/?room={room.id}")
 
 
+@app.post("/rooms/{room_id}/invite")
+async def create_room_invite(room_id: str, user: dict = Depends(require_user)):
+    try:
+        _restore_room(room_id)
+    except KeyError:
+        raise HTTPException(404, "room not found")
+    if not auth_store.authorize_room(room_id, user["id"]):
+        raise HTTPException(403, "You do not have access to this room.")
+    return {"share_url": _invite_url(room_id, user["id"])}
+
+
 @app.websocket("/ws/{room_id}")
-async def room_socket(ws: WebSocket, room_id: str, user_id: str = "", name: str = "Guest"):
+async def room_socket(ws: WebSocket, room_id: str):
     try:
         room = _restore_room(room_id)
     except KeyError:
         await ws.close(code=4404, reason="room not found")
         return
+    user = auth_store.get_session_user(ws.cookies.get("multiplayer_session"))
+    if not user:
+        await ws.close(code=4401, reason="authentication required")
+        return
+    origin = ws.headers.get("origin")
+    host = ws.headers.get("host", "").lower()
+    if origin and urlsplit(origin).netloc.lower() != host:
+        await ws.close(code=4403, reason="cross-origin websocket rejected")
+        return
+    if not auth_store.authorize_room(room_id, user["id"]):
+        await ws.close(code=4403, reason="room access denied")
+        return
     if room.pause_event is None:
         _init_room_controls(room)
     await ws.accept()
-    uid = user_id[:80] or uuid.uuid4().hex[:12]
-    user = User(id=uid, name=name[:80] or "Guest")
+    uid = user["id"]
+    connection_id = uuid.uuid4().hex
+    participant = User(id=uid, name=user["name"])
     room.sockets.add(ws)
     outbox: asyncio.Queue = asyncio.Queue()
     room.outboxes[ws] = outbox
@@ -274,10 +389,11 @@ async def room_socket(ws: WebSocket, room_id: str, user_id: str = "", name: str 
     private_subscriber = subscriber
     private_topic = f"room:{room.id}:user:{uid}"
     room.bus.subscribe(private_topic, private_subscriber)
-    member = {"id": uid, "name": user.name, "connected_at": time.time()}
-    room.members[uid] = member
+    member = {"id": uid, "name": participant.name, "connection_id": connection_id,
+              "connected_at": time.time()}
+    room.members[connection_id] = member
     store.add_member(room.id, member)
-    await broadcast(room, "room.presence", {"members": store.list_members(room.id)}, sender=uid)
+    await broadcast(room, "room.presence", {"members": _unique_members(room.id)}, sender=uid)
     room.graph = store.load(room.id)
     outbox.put_nowait(json.dumps(Envelope.event(MessageKind.STATE_SNAPSHOT, room.id,
         {"graph": room.graph.to_dict(), "run_state": _run_state(room),
@@ -297,9 +413,12 @@ async def room_socket(ws: WebSocket, room_id: str, user_id: str = "", name: str 
             try:
                 if request.get("method") == "ping":
                     store.add_member(room.id, {**member, "connected_at": time.time()})
+                    held = room.lock.current()
+                    if held.holder_id == uid:
+                        room.lock.renew(held.token, uid)
                     result = {"ok": True, "ts": time.time()}
                 else:
-                    result = await dispatch(room, uid, user.name, request.get("method", ""),
+                    result = await dispatch(room, uid, participant.name, request.get("method", ""),
                                             request.get("args") or {})
                 payload = {"reply_to": request_id, "ok": True, "result": result}
             except (ValueError, KeyError, SteeringError, GraphError) as exc:
@@ -323,16 +442,16 @@ async def room_socket(ws: WebSocket, room_id: str, user_id: str = "", name: str 
         if writer and not writer.done():
             writer.cancel()
         room.outboxes.pop(ws, None)
-        room.members.pop(uid, None)
-        store.remove_member(room.id, uid)
+        room.members.pop(connection_id, None)
+        store.remove_member(room.id, connection_id)
         for gate in store.reconcile_approvals(
-                room.id, [member.get("id") for member in store.list_members(room.id)]):
+                room.id, [member.get("id") for member in _unique_members(room.id)]):
             await broadcast(room, "approval.updated", gate, sender="server")
         current_lock = room.lock.current()
-        if current_lock.holder_id == uid:
+        if current_lock.holder_id == uid and not any(member.get("id") == uid for member in _unique_members(room.id)):
             room.lock.release(current_lock.token)
             await broadcast(room, "steering.lock_changed", {"lock": _safe_lock(room)}, sender=uid)
-        await broadcast(room, "room.presence", {"members": store.list_members(room.id)}, sender=uid)
+        await broadcast(room, "room.presence", {"members": _unique_members(room.id)}, sender=uid)
 
 
 async def dispatch(room: Room, uid: str, name: str, method: str, args: dict) -> Any:
@@ -348,7 +467,7 @@ async def dispatch(room: Room, uid: str, name: str, method: str, args: dict) -> 
         return {"lock": {k: v for k, v in lock.items() if k != "token"}}
     if method == "steering.handoff":
         target_id = str(args.get("target_id", ""))
-        target = next((m for m in store.list_members(room.id) if m.get("id") == target_id), None)
+        target = next((m for m in _unique_members(room.id) if m.get("id") == target_id), None)
         if target is None:
             raise ValueError("handoff target must be connected to this room")
         lock = asdict(room.lock.handoff(str(args.get("token", "")), uid,
@@ -405,7 +524,7 @@ async def dispatch(room: Room, uid: str, name: str, method: str, args: dict) -> 
         gate_id = str(args.get("gate_id", ""))
         gate = store.cast_approval_vote(gate_id, uid, name, bool(args.get("approve", False)),
                                         str(args.get("reason", "")),
-                                        active_voters=[member.get("id") for member in store.list_members(room.id)])
+                                        active_voters=[member.get("id") for member in _unique_members(room.id)])
         await broadcast(room, "approval.updated", gate, sender=uid)
         return gate
     if method == "agent.start":

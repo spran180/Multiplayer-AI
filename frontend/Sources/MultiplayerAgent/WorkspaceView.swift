@@ -20,18 +20,28 @@ struct WorkspaceView: View {
     @State private var roomCode = ""
     @State private var showGraphExplorer = false
     @State private var showMembersPopover = false
+    @State private var authEmail = ""
+    @State private var authPassword = ""
+    @State private var authName = ""
+    @State private var creatingAccount = false
 
     private var nodes: [[String: Any]] { model.graph["nodes"] as? [[String: Any]] ?? [] }
     private var head: String? { model.graph["head_id"] as? String }
 
     var body: some View {
-        HStack(spacing: 0) {
-            sidebar
-            Rectangle().fill(Palette.line).frame(width: 1)
-            VStack(spacing: 0) {
-                topBar
-                if model.selectedRoom == nil { welcome }
-                else { dashboard }
+        Group {
+            if model.isAuthenticated {
+                HStack(spacing: 0) {
+                    sidebar
+                    Rectangle().fill(Palette.line).frame(width: 1)
+                    VStack(spacing: 0) {
+                        topBar
+                        if model.selectedRoom == nil { welcome }
+                        else { dashboard }
+                    }
+                }
+            } else {
+                authentication
             }
         }
         .background(Palette.background)
@@ -47,6 +57,44 @@ struct WorkspaceView: View {
             get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("OK") { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
+    }
+
+    private var authentication: some View {
+        VStack(spacing: 18) {
+            HStack(spacing: 11) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .foregroundStyle(Palette.mint).frame(width: 42, height: 42)
+                    .background(Palette.mint.opacity(0.16)).clipShape(RoundedRectangle(cornerRadius: 12))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("MULTIPLAYER").font(.system(size: 14, weight: .black, design: .rounded)).tracking(2)
+                    Text("SHARED AI AGENT WORKSPACES").font(.system(size: 8, weight: .bold)).tracking(1.2).foregroundStyle(Palette.muted)
+                }
+            }
+            Text(creatingAccount ? "Create your account" : "Sign in")
+                .font(.system(size: 23, weight: .bold, design: .rounded))
+            if creatingAccount {
+                TextField("Your name", text: $authName).textFieldStyle(.roundedBorder)
+            }
+            TextField("Email address", text: $authEmail).textFieldStyle(.roundedBorder)
+                .textContentType(.username).autocorrectionDisabled()
+            SecureField("Password (at least 10 characters)", text: $authPassword)
+                .textFieldStyle(.roundedBorder).textContentType(creatingAccount ? .newPassword : .password)
+            Button {
+                Task { await model.authenticate(email: authEmail, password: authPassword,
+                                                name: creatingAccount ? authName : nil) }
+            } label: {
+                Text(creatingAccount ? "Create account" : "Sign in")
+                    .font(.system(size: 12, weight: .bold)).frame(maxWidth: .infinity)
+                    .padding(.vertical, 11).background(Palette.mint).foregroundStyle(Palette.background)
+                    .clipShape(RoundedRectangle(cornerRadius: 9))
+            }.buttonStyle(.plain)
+            Button(creatingAccount ? "Already have an account? Sign in" : "Create an account") {
+                creatingAccount.toggle()
+            }.buttonStyle(.plain).foregroundStyle(Palette.mint)
+        }
+        .padding(26).frame(width: 380).background(Palette.panel)
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var sidebar: some View {
@@ -100,6 +148,10 @@ struct WorkspaceView: View {
                 }
             }
             Spacer()
+            Button { Task { await model.signOut() } } label: {
+                Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
+                    .font(.system(size: 10, weight: .medium)).foregroundStyle(Palette.muted)
+            }.buttonStyle(.plain)
             HStack(spacing: 8) {
                 Circle().fill(model.connectionState == "Connected" ? Palette.mint : .orange).frame(width: 7, height: 7)
                 Text(model.connectionState).font(.system(size: 10, weight: .medium)).foregroundStyle(Palette.muted)
@@ -538,13 +590,21 @@ struct WorkspaceView: View {
         guard !input.isEmpty else { return }
         roomCode = ""
         let id: String
+        let invite: String?
         if let url = URL(string: input), let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
             id = components.queryItems?.first(where: { $0.name == "room" })?.value
                 ?? components.path.split(separator: "/").last.map(String.init) ?? input
-        } else { id = input }
+            invite = components.queryItems?.first(where: { $0.name == "invite" })?.value
+        } else { id = input; invite = nil }
         Task {
             do {
-                let (data, _) = try await URLSession.shared.data(from: model.baseURL.appending(path: "rooms/\(id)"))
+                var components = URLComponents(url: model.baseURL.appending(path: "rooms/\(id)"), resolvingAgainstBaseURL: false)!
+                if let invite { components.queryItems = [URLQueryItem(name: "invite", value: invite)] }
+                let (data, response) = try await URLSession.shared.data(from: components.url!)
+                guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+                    throw NSError(domain: "MultiplayerRoom", code: (response as? HTTPURLResponse)?.statusCode ?? 0,
+                                  userInfo: [NSLocalizedDescriptionKey: "Room could not be opened. Sign in and use a valid invite link."])
+                }
                 let room = try JSONDecoder().decode(RoomSummary.self, from: data)
                 if !model.rooms.contains(where: { $0.id == room.id }) { model.rooms.insert(room, at: 0) }
                 await model.connect(to: room)

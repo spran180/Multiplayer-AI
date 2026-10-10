@@ -49,6 +49,7 @@ class AIAgentCore:
         self._set_state(RunState.RUNNING)
         self.room.pause_event.set()
         self.room.interrupt_event.clear()
+        lease_heartbeat = asyncio.create_task(self._renew_run_lease())
         memories = [MemoryEntry(kind="user", text=task)]
         steps = 0
         try:
@@ -144,11 +145,31 @@ class AIAgentCore:
             self.emit("agent.error", {"message": f"Agent runtime failed: {exc}"})
             self.emit("agent.done", {"state": "failed", "steps": steps})
         finally:
+            lease_heartbeat.cancel()
+            try:
+                await lease_heartbeat
+            except asyncio.CancelledError:
+                pass
             self.room.bus.unsubscribe(topic, receive)
             if self.room.run_lease_token:
                 self.room.store.release_run(self.room.id, self.room.run_lease_token)
                 self.room.run_lease_token = None
             self.room.run_task = None
+
+    async def _renew_run_lease(self):
+        """Keep the shared run lease alive while planning or awaiting review."""
+        while True:
+            await asyncio.sleep(30)
+            token = self.room.run_lease_token
+            if not token:
+                return
+            renewed = await asyncio.to_thread(self.room.store.renew_run, self.room.id, token)
+            if not renewed:
+                self.room.interrupt_event.set()
+                self.room.pause_event.set()
+                self._set_state(RunState.INTERRUPTED)
+                self.emit("agent.error", {"message": "Agent run lost its shared Redis lease and stopped to prevent duplicate execution."})
+                return
 
     def _set_state(self, state: RunState):
         self.room.run_state = state
@@ -202,13 +223,23 @@ class AIAgentCore:
         future = asyncio.get_running_loop().create_future()
         self.room.approval_waiters[gate_id] = future
         self.emit("approval.requested", gate)
+        interrupted = asyncio.create_task(self.room.interrupt_event.wait())
         try:
-            return await asyncio.wait_for(future, timeout=self.approval_timeout)
-        except asyncio.TimeoutError:
+            done, _ = await asyncio.wait(
+                {future, interrupted}, timeout=self.approval_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if future in done:
+                return bool(future.result()) and not self.room.interrupt_event.is_set()
             gate = self.room.store.expire_approval(gate_id) or {"gate_id": gate_id, "status": "expired"}
             self.emit("approval.updated", gate)
             return False
         finally:
+            interrupted.cancel()
+            try:
+                await interrupted
+            except asyncio.CancelledError:
+                pass
             self.room.approval_waiters.pop(gate_id, None)
 
     async def _checkpoint(self, label, memories, state=RunState.RUNNING):

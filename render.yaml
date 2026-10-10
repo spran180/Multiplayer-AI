@@ -7,6 +7,8 @@ services:
     envVars:
       - key: DATABASE_PATH
         value: /tmp/state.sqlite3
+      - key: REDIS_URL
+        sync: false
       - key: LLM_PROVIDER
         value: auto
       - key: GROQ_API_KEY

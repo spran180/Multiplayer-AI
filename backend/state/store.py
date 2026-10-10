@@ -104,7 +104,8 @@ class StateStore:
 
     def add_member(self, room_id: str, member: dict) -> None:
         with self._lock:
-            self._members.setdefault(room_id, {})[member["id"]] = dict(member)
+            connection_id = member.get("connection_id", member["id"])
+            self._members.setdefault(room_id, {})[connection_id] = dict(member)
 
     def remove_member(self, room_id: str, user_id: str) -> None:
         with self._lock:
@@ -377,16 +378,18 @@ class RedisStateStore:
         return self._room_key(room_id, f"member:{user_id}")
 
     def add_member(self, room_id: str, member: dict) -> None:
-        key = self._member_key(room_id, member["id"])
+        connection_id = member.get("connection_id", member["id"])
+        key = self._member_key(room_id, connection_id)
         pipe = self.client.pipeline(transaction=True)
         pipe.set(key, json.dumps(member), ex=86400)
-        pipe.sadd(self._members_key(room_id), member["id"])
+        pipe.sadd(self._members_key(room_id), connection_id)
         pipe.execute()
 
     def remove_member(self, room_id: str, user_id: str) -> None:
+        connection_id = user_id
         pipe = self.client.pipeline(transaction=True)
-        pipe.delete(self._member_key(room_id, user_id))
-        pipe.srem(self._members_key(room_id), user_id)
+        pipe.delete(self._member_key(room_id, connection_id))
+        pipe.srem(self._members_key(room_id), connection_id)
         pipe.execute()
 
     def list_members(self, room_id: str) -> List[dict]:
