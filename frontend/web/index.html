@@ -21,9 +21,31 @@
     #graphDialog{margin:auto;overflow:hidden}
     #graphFull{overflow:auto;display:flex;align-items:flex-start;gap:9px;padding:24px;transform-origin:top left}
     #members{cursor:pointer}
+    .lobby{max-width:900px;margin:8vh auto;padding:24px}
+    .lobbyintro{color:var(--muted);max-width:620px;margin:4px 0 22px}
+    .lobbyform{display:flex;gap:10px;align-items:center}
+    .lobbyform input{flex:1;min-width:0}
+    .roomlist{display:grid;gap:9px;margin-top:12px}
+    .roomitem{display:flex;align-items:center;gap:12px;padding:13px;background:#10131b;border:1px solid var(--line);border-radius:10px}
+    .roomitem .meta{margin-top:3px}
+    .lobbyerror{color:var(--red);margin-top:12px;white-space:pre-wrap}
+    @media(max-width:600px){.lobby{margin:4vh auto;padding:14px}.lobbyform{align-items:stretch;flex-direction:column}.roomitem{align-items:flex-start;flex-wrap:wrap}.roomitem .spacer{display:none}}
   </style>
 </head>
 <body>
+  <main id="lobby" class="shell lobby" hidden>
+    <header class="top"><div class="logo">✳</div><div><div class="brand">MULTIPLAYER</div><div class="subbrand">SHARED AI AGENT WORKSPACES</div></div><div class="spacer"></div><span class="pill"><i class="dot on"></i>READY</span></header>
+    <section class="card">
+      <div class="cardhead"><div><h2>Create a workspace</h2><div class="eyebrow">START A SHARED AGENT ROOM</div></div></div>
+      <p class="lobbyintro">Create a room, then invite teammates with its shared link. Everyone in the room can watch the agent run and collaborate in real time.</p>
+      <form id="createRoomForm" class="lobbyform"><input id="newRoomName" maxlength="120" placeholder="Workspace name (for example, Product research)" aria-label="Workspace name"><button id="createRoomButton" class="primary" type="submit">＋ Create workspace</button></form>
+      <div id="lobbyError" class="lobbyerror" role="alert" hidden></div>
+    </section>
+    <section class="card" style="margin-top:16px">
+      <div class="cardhead"><div><h2>Your available workspaces</h2><div class="eyebrow">OPEN AN EXISTING ROOM</div></div><div class="spacer"></div><button id="refreshRooms" type="button">Refresh</button></div>
+      <div id="roomList" class="roomlist"><div class="empty">Loading workspaces…</div></div>
+    </section>
+  </main>
   <div id="loading" class="loading">Connecting to the shared agent room…</div>
   <main id="app" class="shell" hidden>
     <header class="top">
@@ -72,7 +94,8 @@
   <div id="toast" class="toast"></div>
 <script>
 (() => {
-  const roomId = new URLSearchParams(location.search).get('room') || location.pathname.split('/').filter(Boolean).pop();
+  const pathParts = location.pathname.split('/').filter(Boolean);
+  const roomId = new URLSearchParams(location.search).get('room') || (pathParts.length && pathParts[pathParts.length-1] !== 'app' ? pathParts[pathParts.length-1] : '');
   const $ = id => document.getElementById(id);
   const appState = {socket:null, token:null, holder:null, graph:null, graphZoom:1, events:[], transcript:[], finalResult:'', members:[], pending:new Map(), gates:new Map(), selected:null, seq:0, userId:crypto.randomUUID(), name:localStorage.getItem('agent-name')||'Teammate'};
   const h = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -92,7 +115,11 @@
   function frame(type,payload){return {type,v:1,id:crypto.randomUUID(),room_id:roomId,seq:++appState.seq,ts:Date.now()/1000,sender:appState.userId,payload}}
   function rpc(method,args={}){if(!appState.socket||appState.socket.readyState!==WebSocket.OPEN)return Promise.reject(Error('Room is disconnected'));const id=crypto.randomUUID();return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{appState.pending.delete(id);reject(Error('Request timed out'))},30000);appState.pending.set(id,{resolve:value=>{clearTimeout(timer);resolve(value)},reject:error=>{clearTimeout(timer);reject(error)}});appState.socket.send(JSON.stringify(frame('rpc',{id,method,args})))})}
   function connect(){const protocol=location.protocol==='https:'?'wss:':'ws:';const ws=new WebSocket(`${protocol}//${location.host}/ws/${encodeURIComponent(roomId)}?user_id=${encodeURIComponent(appState.userId)}&name=${encodeURIComponent(appState.name)}`);appState.socket=ws;ws.onopen=()=>{$('connection').textContent='CONNECTED';$('statusdot').classList.add('on')};ws.onclose=()=>{$('connection').textContent='RECONNECTING';$('statusdot').classList.remove('on');setTimeout(connect,1500)};ws.onerror=()=>{};ws.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}const p=message.payload||{};if(message.type==='rpc.response'){const pending=appState.pending.get(p.reply_to);if(!pending)return;appState.pending.delete(p.reply_to);p.ok?pending.resolve(p.result||{}):pending.reject(Error(p.error?.message||'Request failed'));return}if(message.type==='state.snapshot'){appState.graph=p.graph||{};$('runstate').textContent=(p.run_state||'idle').toUpperCase();if(!appState.finalResult)appState.finalResult=recoveredResult();renderGraph()}if(message.type==='state.node_added')mergeGraphNode(p);if(message.type==='state.branch'||message.type==='state.merge'){rpc('state.graph').then(g=>{appState.graph=g;renderGraph()}).catch(()=>{})}if(message.type==='room.presence'){appState.members=p.members||[];renderPresence()}if(message.type==='steering.lock_changed'){renderLock(p.lock||{});if(p.your_token)appState.token=p.your_token}if(message.type==='agent.started')$('runstate').textContent='RUNNING';if(message.type==='agent.done'||message.type==='steering.status')$('runstate').textContent=(p.state||$('runstate').textContent).toUpperCase();if(message.type==='approval.requested'||message.type==='approval.updated'){appState.gates.set(p.gate_id,p);renderGates()}if(message.type==='approval.updated'&&p.status!=='pending'){toast(`Action ${p.status}`)}addEvent({type:message.type,payload:p,ts:message.ts})}}
-  async function join(){if(!roomId){$('loading').textContent='This invite link does not include a room ID.';return}try{const response=await fetch(`/rooms/${encodeURIComponent(roomId)}`);if(!response.ok)throw Error('Room not found or invite expired');const room=await response.json();$('roomname').textContent=room.name;$('roomid').textContent=`ROOM / ${room.id}`;$('runstate').textContent=room.run_state.toUpperCase();appState.graph=room.graph||{};appState.finalResult=recoveredResult();(room.approvals||[]).forEach(g=>appState.gates.set(g.gate_id,g));$('loading').hidden=true;$('app').hidden=false;renderGraph();renderPresence();renderGates();connect();setInterval(()=>{if(appState.socket?.readyState===WebSocket.OPEN)rpc('ping').catch(()=>{})},20000)}catch(e){$('loading').textContent=e.message}}
+  function roomUrl(room){return room.share_url||`${location.origin}/r/${encodeURIComponent(room.id)}`}
+  function renderRooms(rooms){const host=$('roomList');if(!rooms.length){host.innerHTML='<div class="empty">No rooms yet. Create a workspace above to get started.</div>';return}host.innerHTML=rooms.map(room=>`<article class="roomitem"><div><b>${h(room.name||'Shared agent room')}</b><div class="meta">${h(room.run_state||'idle')} · ${Number(room.member_count)||0} connected · ${h(String(room.id).slice(0,16))}</div></div><div class="spacer"></div><button type="button" data-open-room="${h(room.id)}">Open room</button><button type="button" data-copy-room="${h(room.id)}">Copy invite</button></article>`).join('');host.querySelectorAll('[data-open-room]').forEach(button=>button.onclick=()=>{location.href=`/app/?room=${encodeURIComponent(button.dataset.openRoom)}`});host.querySelectorAll('[data-copy-room]').forEach(button=>button.onclick=async()=>{const room=rooms.find(item=>item.id===button.dataset.copyRoom);try{await navigator.clipboard.writeText(roomUrl(room));toast('Invite link copied')}catch{toast(roomUrl(room))}})}
+  async function loadRooms(){const host=$('roomList');try{const response=await fetch('/rooms');if(!response.ok)throw Error(`Could not load rooms (${response.status})`);renderRooms(await response.json())}catch(error){host.innerHTML=`<div class="empty">${h(error.message)}. Check that the backend is deployed and reachable.</div>`}}
+  async function createRoom(event){event.preventDefault();const button=$('createRoomButton'),error=$('lobbyError'),name=$('newRoomName').value.trim()||'Shared agent room';button.disabled=true;button.textContent='Creating…';error.hidden=true;try{const response=await fetch('/rooms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});const result=await response.json().catch(()=>({}));if(!response.ok)throw Error(result.detail||`Could not create room (${response.status})`);location.href=`/app/?room=${encodeURIComponent(result.id)}`}catch(err){error.textContent=`${err.message}. If you just deployed, wait for the latest deployment to finish and refresh.`;error.hidden=false;button.disabled=false;button.textContent='＋ Create workspace'}}
+  async function join(){if(!roomId){$('loading').hidden=true;$('lobby').hidden=false;loadRooms();return}try{const response=await fetch(`/rooms/${encodeURIComponent(roomId)}`);if(!response.ok)throw Error('Room not found or invite expired');const room=await response.json();$('roomname').textContent=room.name;$('roomid').textContent=`ROOM / ${room.id}`;$('runstate').textContent=room.run_state.toUpperCase();appState.graph=room.graph||{};appState.finalResult=recoveredResult();(room.approvals||[]).forEach(g=>appState.gates.set(g.gate_id,g));$('loading').hidden=true;$('app').hidden=false;renderGraph();renderPresence();renderGates();connect();setInterval(()=>{if(appState.socket?.readyState===WebSocket.OPEN)rpc('ping').catch(()=>{})},20000)}catch(e){$('loading').textContent=e.message}}
   async function takeControl(){try{const result=await rpc('steering.acquire');appState.token=result.lock.token;appState.holder=appState.name;toast('You have the steering token')}catch(e){toast(e.message)}}
   async function steer(action,extra={}){if(!appState.token){await takeControl();if(!appState.token)return}try{await rpc(`steering.${action}`,{token:appState.token,...extra})}catch(e){toast(e.message)}}
   async function vote(gateId,approve){try{const gate=await rpc('approval.vote',{gate_id:gateId,approve,reason:''});appState.gates.set(gateId,gate);renderGates()}catch(e){toast(e.message)}}
@@ -108,6 +135,7 @@
   $('setenv').onclick=()=>{const key=$('envkey').value.trim(),value=$('envvalue').value;if(!key)return toast('Enter a variable name');steer('set_env',{key,value}).then(()=>{$('envvalue').value='';toast(`Updated ${key}`)})};
   $('start').onclick=async()=>{const task=$('task').value.trim();if(!task)return;try{await rpc('agent.start',{task});$('task').value=''}catch(e){toast(e.message)}};
   $('task').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('start').click()}});
+  $('createRoomForm').addEventListener('submit',createRoom);$('refreshRooms').onclick=loadRooms;
   const entered=prompt('Your name for this room',appState.name);if(entered?.trim()){appState.name=entered.trim().slice(0,80);localStorage.setItem('agent-name',appState.name)}join();
 })();
 </script>
