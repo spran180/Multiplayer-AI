@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.agent.core import AgentRunner
+from backend.agent.core import AIAgentCore
 from backend.agent.llm.groq import GroqPlanner
 from backend.agent.llm.mock import MockPlanner
 from backend.agent.llm.ollama import OllamaPlanner
@@ -424,9 +424,14 @@ async def dispatch(room: Room, uid: str, name: str, method: str, args: dict) -> 
         room.run_requested_by = uid
         room.graph = store.load(room.id)
         planner = _create_planner()
-        runner = AgentRunner(room, planner, lambda kind, payload: asyncio.create_task(broadcast(room, kind, payload)),
-                             settings.max_agent_steps, settings.approval_quorum,
-                             settings.approval_timeout_seconds)
+        runner = AIAgentCore(
+            room,
+            planner,
+            lambda kind, payload: asyncio.create_task(broadcast(room, kind, payload)),
+            settings.max_agent_steps,
+            settings.approval_quorum,
+            settings.approval_timeout_seconds,
+        )
         room.run_task = asyncio.create_task(runner.run(task))
         return {"started": True, "model": planner.name}
     if method == "agent.status":

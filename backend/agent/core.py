@@ -6,7 +6,7 @@ import json
 import re
 import uuid
 from dataclasses import asdict
-from typing import Callable
+from typing import Any, Callable
 
 from shared.protocols.python.protocols import MemoryEntry, RunState, Snapshot
 from backend.agent.llm.base import LLMClient
@@ -16,8 +16,9 @@ from backend.state.snapshot import stamp
 SIDE_EFFECT_TOOLS = {"apply_change"}
 
 
-class AgentRunner:
-    def __init__(self, room, planner: LLMClient, emit: Callable[[str, dict], None],
+class AIAgentCore:
+    def __init__(self, room, planner: LLMClient,
+                 emit: Callable[[str, dict[str, Any]], Any],
                  max_steps=12, approval_quorum=2, approval_timeout=300):
         self.room, self.planner, self.emit = room, planner, emit
         self.max_steps = max_steps
@@ -54,12 +55,13 @@ class AgentRunner:
             await self._checkpoint("Task started", memories)
             self.emit("agent.started", {"task": task, "model": self.planner.name})
             for step_index in range(self.max_steps):
-                steps = step_index
                 await self.room.pause_event.wait()
                 if self.room.interrupt_event.is_set():
                     self._set_state(RunState.INTERRUPTED)
                     self.emit("agent.done", {"state": "interrupted", "steps": step_index})
                     return
+
+                steps = step_index + 1
 
                 injections, self.room.injections = self.room.injections, []
                 for note in injections:
@@ -76,11 +78,11 @@ class AgentRunner:
                 except Exception as exc:
                     self._set_state(RunState.FAILED)
                     self.emit("agent.error", {"message": f"Planner failed: {exc}"})
-                    self.emit("agent.done", {"state": "failed", "steps": step_index})
+                    self.emit("agent.done", {"state": "failed", "steps": steps})
                     return
                 if self.room.interrupt_event.is_set():
                     self._set_state(RunState.INTERRUPTED)
-                    self.emit("agent.done", {"state": "interrupted", "steps": step_index})
+                    self.emit("agent.done", {"state": "interrupted", "steps": steps})
                     return
 
                 if decision.thought:
@@ -110,6 +112,7 @@ class AgentRunner:
                         await self._checkpoint(f"Rejected {decision.tool}", memories)
                         continue
 
+                runtime_env = {}
                 try:
                     runtime_env = self.room.store.get_runtime_env(self.room.id)
                     resolved_args = _expand_env(decision.tool_args, runtime_env)
@@ -118,8 +121,9 @@ class AgentRunner:
                     self.emit("agent.tool_result", {"tool": decision.tool, "result": result,
                                                      "step_index": step_index})
                 except Exception as exc:
-                    memories.append(MemoryEntry(kind="tool", text=f"{decision.tool} failed: {exc}"))
-                    self.emit("agent.error", {"message": f"Tool {decision.tool} failed: {exc}"})
+                    safe_error = _redact(str(exc), runtime_env)
+                    memories.append(MemoryEntry(kind="tool", text=f"{decision.tool} failed: {safe_error}"))
+                    self.emit("agent.error", {"message": f"Tool {decision.tool} failed: {safe_error}"})
                 await self._checkpoint(f"Ran {decision.tool}", memories)
 
             final = "Stopped after reaching the configured step limit."
@@ -244,3 +248,7 @@ def _redact(value, environment):
     if isinstance(value, dict):
         return {key: _redact(item, environment) for key, item in value.items()}
     return value
+
+
+# Backward-compatible name used by older integrations.
+AgentRunner = AIAgentCore
