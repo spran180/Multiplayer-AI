@@ -76,18 +76,13 @@ Set `REDIS_URL` to enable cross-replica state and coordination. Without Redis, S
 
 For a public invite URL, set `PUBLIC_BASE_URL` to the HTTPS hostname that routes to this server. The default is local-only (`http://localhost:8000`), so copied invite links will not work for remote teammates until public DNS and HTTPS routing are configured. The macOS client can continue using its local API address on the host; teammates can use the browser invite URL.
 
-### Host on Render
+### Free demo hosting on Render
 
-The repository includes a Render Blueprint in `render.yaml`. It deploys the Docker app as one web service, stores SQLite state on a persistent disk, and uses Render's assigned HTTPS URL for room invites. The service runs as one instance, so its in-process WebSocket presence and coordination work without Redis.
+The repository includes a Render Blueprint in `render.yaml`. It deploys the Docker app as one free web service and uses Render's assigned HTTPS URL for room invites. The Docker entrypoint honors Render's `PORT` setting. The service runs as one instance, so in-process WebSocket presence and coordination work without Redis.
 
-To deploy:
+To deploy, push this repository to GitHub, connect it to Render, and create a Blueprint from `render.yaml`. Add `GROQ_API_KEY` in the Render service's environment settings if you want Groq-powered agent runs; without it, the mock planner is used. After deployment, open the assigned `onrender.com` URL.
 
-1. Push this repository to a GitHub repository and connect that repository to a Render account.
-2. In Render, create a new Blueprint from the repository and review the service and disk charges before applying it. Render's free web services cannot use persistent disks, and their files are erased on restart or redeploy; the configured disk is required to preserve room history.
-3. Add `GROQ_API_KEY` in the Render service's environment settings if you want Groq-powered agent runs. The deployment works without it using the mock planner.
-4. After the first deploy, open the assigned `onrender.com` URL and create a room. The app reads `RENDER_EXTERNAL_URL` to generate invite links for that address.
-
-The site is publicly reachable and does not currently require sign-in; anyone with a room invite can join that room. Use non-sensitive demo data until authentication is added.
+This free setup is for demos: Render spins down the service after 15 minutes without activity, and room history in SQLite is lost on restarts, spin-downs, or redeploys. The next visit can take about a minute to wake the service. GitHub Pages alone cannot host this app's Python API or WebSocket server. The site has no sign-in, so anyone with a room invite can join; use non-sensitive demo data.
 
 ### Free DuckDNS hostname
 

@@ -2,15 +2,11 @@ services:
   - type: web
     name: multiplayer-ai-agent
     runtime: docker
-    plan: starter
+    plan: free
     healthCheckPath: /health
-    disk:
-      name: agent-state
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: DATABASE_PATH
-        value: /var/data/state.sqlite3
+        value: /tmp/state.sqlite3
       - key: LLM_PROVIDER
         value: auto
       - key: GROQ_API_KEY
