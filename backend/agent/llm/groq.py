@@ -42,7 +42,7 @@ class GroqPlanner(LLMClient):
             ],
         }
         response = self._post_with_retry(httpx, body)
-        response.raise_for_status()
+        self._raise_for_status(response)
         raw = response.json()["choices"][0]["message"]["content"]
         data = json.loads(raw)
         tool = data.get("tool")
@@ -71,9 +71,34 @@ class GroqPlanner(LLMClient):
             "response_format": {"type": "json_object"},
         }
         response = self._post_with_retry(httpx, body)
-        response.raise_for_status()
+        self._raise_for_status(response)
         content = response.json()["choices"][0]["message"]["content"]
         return str(json.loads(content).get("merged_output", "")).strip() or super().merge_outputs(left, right)
+
+    @staticmethod
+    def _raise_for_status(response) -> None:
+        """Keep Groq's actionable error message instead of only its HTTP status."""
+        if response.is_success:
+            return
+
+        message = ""
+        try:
+            payload = response.json()
+            error = payload.get("error", {}) if isinstance(payload, dict) else {}
+            if isinstance(error, dict):
+                message = str(error.get("message") or "")
+                failed_generation = error.get("failed_generation")
+                if failed_generation:
+                    message += f"; failed_generation={json.dumps(failed_generation, ensure_ascii=False)}"
+        except (ValueError, TypeError):
+            pass
+
+        if not message:
+            message = response.text[:1000].strip()
+        detail = f": {message}" if message else ""
+        raise RuntimeError(
+            f"Groq rejected the request (HTTP {response.status_code}){detail}"
+        )
 
     def _post_with_retry(self, httpx, body):
         """Retry transient provider limits/outages, honoring Groq's Retry-After."""
