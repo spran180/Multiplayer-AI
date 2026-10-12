@@ -14,10 +14,7 @@ from __future__ import annotations
 
 import threading
 import json
-import logging
 from typing import Any, Callable, Dict, List
-
-logger = logging.getLogger(__name__)
 
 
 class PubSubBus:
@@ -68,7 +65,7 @@ class RedisPubSubBus(PubSubBus):
         self._redis = redis.Redis.from_url(url, decode_responses=True, **kwargs)
         self._redis.ping()
         self._topic_lock = threading.RLock()
-        self._topic_workers: Dict[str, tuple[list, threading.Thread, threading.Event]] = {}
+        self._topic_workers: Dict[str, tuple[Any, threading.Thread, threading.Event]] = {}
 
     def subscribe(self, topic: str, handler: Callable[[Any], None]) -> None:
         with self._topic_lock:
@@ -77,61 +74,34 @@ class RedisPubSubBus(PubSubBus):
                 return
             pubsub = self._redis.pubsub(ignore_subscribe_messages=True)
             pubsub.subscribe(topic)
-            pubsub_ref = [pubsub]
             stop = threading.Event()
-            worker = threading.Thread(target=self._listen, args=(topic, pubsub_ref, stop),
+            worker = threading.Thread(target=self._listen, args=(topic, pubsub, stop),
                                       name=f"redis-sub-{topic}", daemon=True)
-            self._topic_workers[topic] = (pubsub_ref, worker, stop)
+            self._topic_workers[topic] = (pubsub, worker, stop)
             worker.start()
 
-    def _listen(self, topic: str, pubsub_ref: list, stop: threading.Event) -> None:
-        backoff = 0.5
-        while not stop.is_set():
-            pubsub = pubsub_ref[0]
-            try:
-                for message in pubsub.listen():
-                    if stop.is_set():
-                        return
-                    if message.get("type") != "message":
-                        continue
-                    payload = message.get("data")
-                    try:
-                        payload = json.loads(payload)
-                    except (TypeError, json.JSONDecodeError):
-                        pass
-                    with self._topic_lock:
-                        handlers = list(self._subs.get(topic, ()))
-                    for handler in handlers:
-                        try:
-                            handler(payload)
-                        except Exception:
-                            logger.exception("Redis pub/sub handler failed for topic %s", topic)
+    def _listen(self, topic: str, pubsub, stop: threading.Event) -> None:
+        try:
+            for message in pubsub.listen():
                 if stop.is_set():
                     return
-                raise ConnectionError("Redis pub/sub listener stopped unexpectedly")
-            except Exception:
-                if stop.is_set():
-                    return
-                logger.warning("Redis pub/sub disconnected for topic %s; reconnecting", topic,
-                               exc_info=True)
+                if message.get("type") != "message":
+                    continue
+                payload = message.get("data")
                 try:
-                    pubsub.close()
-                except Exception:
+                    payload = json.loads(payload)
+                except (TypeError, json.JSONDecodeError):
                     pass
-                if stop.wait(backoff):
-                    return
-                backoff = min(backoff * 2, 10.0)
-                try:
-                    pubsub = self._redis.pubsub(ignore_subscribe_messages=True)
-                    if stop.is_set():
-                        pubsub.close()
-                        return
-                    pubsub_ref[0] = pubsub
-                    pubsub.subscribe(topic)
-                    backoff = 0.5
-                except Exception:
-                    logger.warning("Redis pub/sub resubscribe failed for topic %s", topic,
-                                   exc_info=True)
+                with self._topic_lock:
+                    handlers = list(self._subs.get(topic, ()))
+                for handler in handlers:
+                    try:
+                        handler(payload)
+                    except Exception:
+                        continue
+        except Exception:
+            if not stop.is_set():
+                return
 
     def unsubscribe(self, topic: str, handler: Callable[[Any], None]) -> None:
         with self._topic_lock:
@@ -143,10 +113,10 @@ class RedisPubSubBus(PubSubBus):
             self._subs.pop(topic, None)
             worker_info = self._topic_workers.pop(topic, None)
         if worker_info:
-            pubsub_ref, worker, stop = worker_info
+            pubsub, worker, stop = worker_info
             stop.set()
             try:
-                pubsub_ref[0].close()
+                pubsub.close()
             except Exception:
                 pass
             if worker is not threading.current_thread():
@@ -155,9 +125,6 @@ class RedisPubSubBus(PubSubBus):
     def publish(self, topic: str, payload: Any) -> int:
         value = payload if isinstance(payload, str) else json.dumps(payload, default=str)
         return int(self._redis.publish(topic, value))
-
-    def ping(self) -> bool:
-        return bool(self._redis.ping())
 
     def close(self) -> None:
         with self._topic_lock:

@@ -36,7 +36,6 @@ final class RoomModel: ObservableObject {
     var baseURL = URL(string: ProcessInfo.processInfo.environment["AGENT_SERVER"] ?? "http://127.0.0.1:8000")!
     private var socket: URLSessionWebSocketTask?
     private var reconnectTask: Task<Void, Never>?
-    private var heartbeatTask: Task<Void, Never>?
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
     var userID = ""
     var userName = Host.current().localizedName ?? "Teammate"
@@ -105,8 +104,6 @@ final class RoomModel: ObservableObject {
     func connect(to room: RoomSummary) async {
         reconnectTask?.cancel()
         reconnectTask = nil
-        heartbeatTask?.cancel()
-        heartbeatTask = nil
         socket?.cancel(with: .goingAway, reason: nil)
         selectedRoom = room
         events = []
@@ -125,31 +122,14 @@ final class RoomModel: ObservableObject {
         task.resume()
         connectionState = "Connecting"
         receiveNext(from: task)
-        heartbeatTask?.cancel()
-        heartbeatTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self, self.socket === task else { return }
-                _ = try? await self.call("ping")
-                try? await Task.sleep(nanoseconds: 20_000_000_000)
-            }
-        }
     }
 
     func disconnect() {
         reconnectTask?.cancel()
         reconnectTask = nil
-        heartbeatTask?.cancel()
-        heartbeatTask = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
-        failPendingCalls(with: URLError(.cancelled))
         connectionState = "Disconnected"
-    }
-
-    private func failPendingCalls(with error: Error) {
-        let continuations = Array(pending.values)
-        pending.removeAll()
-        continuations.forEach { $0.resume(throwing: error) }
     }
 
     func call(_ method: String, args: [String: Any] = [:]) async throws -> [String: Any] {
@@ -268,7 +248,6 @@ final class RoomModel: ObservableObject {
                 switch result {
                 case .failure:
                     self.connectionState = "Disconnected"
-                    self.failPendingCalls(with: URLError(.notConnectedToInternet))
                     if let room = self.selectedRoom { self.scheduleReconnect(for: room) }
                 case .success(let message):
                     self.handle(message)

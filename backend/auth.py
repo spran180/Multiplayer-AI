@@ -62,64 +62,12 @@ class AuthStore:
                         created_by TEXT NOT NULL, created_at REAL NOT NULL,
                         PRIMARY KEY(room_id, token_hash)
                     );
-                    CREATE TABLE IF NOT EXISTS auth_rate_limits (
-                        bucket_key TEXT PRIMARY KEY, attempts INTEGER NOT NULL,
-                        reset_at REAL NOT NULL
-                    );
                 """)
                 db.commit()
 
     def close(self):
         if self._redis:
             self._redis.close()
-
-    def ping(self) -> bool:
-        if self._redis:
-            return bool(self._redis.ping())
-        with closing(sqlite3.connect(self._sqlite_path())) as db:
-            db.execute("SELECT 1").fetchone()
-        return True
-
-    def consume_auth_rate_limit(self, action: str, email: str, remote_ip: str,
-                                email_limit: int = 20, ip_limit: int = 100,
-                                window_seconds: int = 300) -> bool:
-        """Bound login/registration attempts across workers and instances."""
-        keys = [
-            f"multiplayer-agent:auth:rate:{action}:email:{_email_key(email)}",
-            f"multiplayer-agent:auth:rate:{action}:ip:{_token_hash(remote_ip or 'unknown')}",
-        ]
-        limits = (email_limit, ip_limit)
-        if self._redis:
-            return bool(self._redis.eval("""
-                local allowed = 1
-                for i, key in ipairs(KEYS) do
-                    local count = redis.call('INCR', key)
-                    if count == 1 then redis.call('EXPIRE', key, ARGV[3]) end
-                    if count > tonumber(ARGV[i]) then allowed = 0 end
-                end
-                return allowed
-            """, len(keys), *keys, *limits, window_seconds))
-
-        now = time.time()
-        with self._lock, closing(sqlite3.connect(self._sqlite_path())) as db:
-            db.execute("BEGIN IMMEDIATE")
-            allowed = True
-            for key, limit in zip(keys, limits):
-                row = db.execute("SELECT attempts, reset_at FROM auth_rate_limits WHERE bucket_key=?",
-                                 (key,)).fetchone()
-                if not row or row[1] <= now:
-                    attempts, reset_at = 1, now + window_seconds
-                    db.execute("INSERT INTO auth_rate_limits VALUES(?,?,?) "
-                               "ON CONFLICT(bucket_key) DO UPDATE SET attempts=excluded.attempts, "
-                               "reset_at=excluded.reset_at", (key, attempts, reset_at))
-                else:
-                    attempts, reset_at = row[0] + 1, row[1]
-                    db.execute("UPDATE auth_rate_limits SET attempts=? WHERE bucket_key=?",
-                               (attempts, key))
-                if attempts > limit:
-                    allowed = False
-            db.commit()
-            return allowed
 
     @staticmethod
     def _password(password: str, salt: bytes) -> str:

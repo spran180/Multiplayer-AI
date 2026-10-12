@@ -49,7 +49,6 @@ class Room:
     approval_waiters: dict[str, asyncio.Future] = field(default_factory=dict)
     runtime_env: dict[str, str] = field(default_factory=dict)
     members: dict[str, dict] = field(default_factory=dict)
-    presence_signature: tuple[str, ...] = ()
     sockets: set[WebSocket] = field(default_factory=set)
     subscribers: dict[WebSocket, Any] = field(default_factory=dict)
     outboxes: dict[WebSocket, asyncio.Queue] = field(default_factory=dict)
@@ -105,10 +104,6 @@ class Registration(Credentials):
     name: str = Field(min_length=1, max_length=80)
 
 
-class RoomCreation(BaseModel):
-    name: str = Field(default="Shared agent room", max_length=100)
-
-
 def require_user(request: Request) -> dict:
     user = auth_store.get_session_user(request.cookies.get("multiplayer_session"))
     if not user:
@@ -120,12 +115,6 @@ def set_session_cookie(response: Response, token: str):
     response.set_cookie("multiplayer_session", token, max_age=30 * 86400,
                         httponly=True, secure=settings.public_base_url.startswith("https://"),
                         samesite="lax", path="/")
-
-
-def _check_auth_rate_limit(request: Request, action: str, email: str) -> None:
-    remote_ip = request.client.host if request.client else "unknown"
-    if not auth_store.consume_auth_rate_limit(action, email, remote_ip):
-        raise HTTPException(429, "Too many authentication attempts. Wait a few minutes and try again.")
 
 
 def _safe_lock(room: Room) -> dict:
@@ -166,7 +155,7 @@ def _create_room(name: str = "Shared agent room", room_id: str | None = None) ->
     rid = room_id or uuid.uuid4().hex
     if rid in rooms:
         raise ValueError("room already exists")
-    room = Room(rid, name.strip()[:100] or "Shared agent room")
+    room = Room(rid, name[:100] or "Shared agent room")
     room.graph = store.load(rid)
     store.create_room(rid, room.created_at, room.name)
     store.set_run_state(rid, RunState.IDLE.value)
@@ -206,45 +195,12 @@ def _init_room_controls(room: Room):
 
 @app.on_event("startup")
 async def initialize_rooms():
-    if settings.llm_provider not in {"auto", "groq", "ollama", "mock"}:
-        raise RuntimeError("LLM_PROVIDER must be auto, groq, ollama, or mock")
-    if not 1 <= settings.max_agent_steps <= 100:
-        raise RuntimeError("MAX_AGENT_STEPS must be between 1 and 100")
-    if not 1 <= settings.approval_quorum <= 50:
-        raise RuntimeError("APPROVAL_QUORUM must be between 1 and 50")
-    if settings.app_env == "production":
-        if not settings.redis_url:
-            raise RuntimeError("REDIS_URL is required when APP_ENV=production")
-        if not settings.public_base_url.startswith("https://"):
-            raise RuntimeError("PUBLIC_BASE_URL must use HTTPS in production")
-        effective_provider = ("groq" if settings.groq_api_key else "mock") if settings.llm_provider == "auto" else settings.llm_provider
-        if effective_provider == "mock":
-            raise RuntimeError("A production deployment must configure a real LLM provider")
-        if effective_provider == "groq" and not settings.groq_api_key:
-            raise RuntimeError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
-        if effective_provider == "ollama" and settings.ollama_base_url.startswith(("http://127.0.0.1", "http://localhost")):
-            raise RuntimeError("Configure a remotely reachable OLLAMA_BASE_URL in production")
     for room in rooms.values():
         _init_room_controls(room)
 
 
 @app.on_event("shutdown")
 async def close_services():
-    active_runs = []
-    for room in rooms.values():
-        task = room.run_task
-        if task and not task.done():
-            if room.interrupt_event:
-                room.interrupt_event.set()
-            if room.pause_event:
-                room.pause_event.set()
-            task.cancel()
-            active_runs.append(task)
-    if active_runs:
-        try:
-            await asyncio.wait_for(asyncio.gather(*active_runs, return_exceptions=True), timeout=10)
-        except asyncio.TimeoutError:
-            pass
     if hasattr(bus, "close"):
         bus.close()
     store.close()
@@ -268,17 +224,6 @@ async def notify_user(room: Room, user_id: str, kind: str, payload: dict):
         return
     env = Envelope.event(message_kind, room.id, payload, sender="server")
     room.bus.publish(f"room:{room.id}:user:{user_id}", json.dumps(env.to_dict(), default=_json_default))
-
-
-async def _refresh_presence(room: Room, sender: str = "server"):
-    members = _unique_members(room.id)
-    signature = tuple(sorted(member.get("id", "") for member in members))
-    if signature == room.presence_signature:
-        return
-    room.presence_signature = signature
-    await broadcast(room, "room.presence", {"members": members}, sender=sender)
-    for gate in store.reconcile_approvals(room.id, signature):
-        await broadcast(room, "approval.updated", gate, sender="server")
 
 
 async def _socket_writer(ws: WebSocket, outbox: asyncio.Queue):
@@ -306,22 +251,8 @@ def health():
             "coordination": "redis" if settings.redis_url else "single-instance"}
 
 
-@app.get("/ready")
-def ready():
-    """Readiness probe: verify every configured shared state dependency."""
-    try:
-        store.ping()
-        auth_store.ping()
-        if hasattr(bus, "ping"):
-            bus.ping()
-    except Exception as exc:
-        raise HTTPException(503, "A configured persistence or coordination service is unavailable.") from exc
-    return {"ok": True, "coordination": "redis" if settings.redis_url else "single-instance"}
-
-
 @app.post("/auth/register", status_code=201)
-def register_account(body: Registration, request: Request, response: Response):
-    _check_auth_rate_limit(request, "register", body.email)
+def register_account(body: Registration, response: Response):
     try:
         user = auth_store.register(body.email, body.password, body.name)
     except AuthError as exc:
@@ -331,8 +262,7 @@ def register_account(body: Registration, request: Request, response: Response):
 
 
 @app.post("/auth/login")
-def login(body: Credentials, request: Request, response: Response):
-    _check_auth_rate_limit(request, "login", body.email)
+def login(body: Credentials, response: Response):
     user = auth_store.authenticate(body.email, body.password)
     if not user:
         raise HTTPException(401, "Email or password is incorrect.")
@@ -367,9 +297,9 @@ def list_rooms(user: dict = Depends(require_user)):
 
 
 @app.post("/rooms")
-async def create_room(body: Optional[RoomCreation] = None, user: dict = Depends(require_user)):
+async def create_room(body: Optional[dict] = None, user: dict = Depends(require_user)):
     try:
-        room = _create_room(body.name if body else "Shared agent room")
+        room = _create_room((body or {}).get("name", "Shared agent room"))
         invite = auth_store.add_room_owner(room.id, user["id"])
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -447,21 +377,13 @@ async def room_socket(ws: WebSocket, room_id: str):
     connection_id = uuid.uuid4().hex
     participant = User(id=uid, name=user["name"])
     room.sockets.add(ws)
-    outbox: asyncio.Queue = asyncio.Queue(maxsize=256)
+    outbox: asyncio.Queue = asyncio.Queue()
     room.outboxes[ws] = outbox
     room.writers[ws] = asyncio.create_task(_socket_writer(ws, outbox))
     loop = asyncio.get_running_loop()
-
-    def enqueue(data):
-        try:
-            outbox.put_nowait(data)
-        except asyncio.QueueFull:
-            # A slow consumer must not retain unbounded room-event history.
-            asyncio.create_task(ws.close(code=1013, reason="client is too slow"))
-
     def subscriber(data):
         encoded = data if isinstance(data, str) else json.dumps(data, default=_json_default)
-        loop.call_soon_threadsafe(enqueue, encoded)
+        loop.call_soon_threadsafe(outbox.put_nowait, encoded)
     room.subscribers[ws] = subscriber
     room.bus.subscribe(f"room:{room.id}", subscriber)
     private_subscriber = subscriber
@@ -471,52 +393,40 @@ async def room_socket(ws: WebSocket, room_id: str):
               "connected_at": time.time()}
     room.members[connection_id] = member
     store.add_member(room.id, member)
-    await _refresh_presence(room, sender=uid)
+    await broadcast(room, "room.presence", {"members": _unique_members(room.id)}, sender=uid)
     room.graph = store.load(room.id)
-    enqueue(json.dumps(Envelope.event(MessageKind.STATE_SNAPSHOT, room.id,
+    outbox.put_nowait(json.dumps(Envelope.event(MessageKind.STATE_SNAPSHOT, room.id,
         {"graph": room.graph.to_dict(), "run_state": _run_state(room),
          "approvals": store.list_approvals(room.id)}, sender="server").to_dict(), default=_json_default))
     lock_view = asdict(room.lock.current())
     token = lock_view.pop("token")
-    enqueue(json.dumps(Envelope.event(MessageKind.STEERING_LOCK_CHANGED, room.id,
+    outbox.put_nowait(json.dumps(Envelope.event(MessageKind.STEERING_LOCK_CHANGED, room.id,
         {"lock": lock_view, "your_token": token if room.lock.current().holder_id == uid else None},
         sender="server").to_dict(), default=_json_default))
     try:
         while True:
-            raw_frame = await ws.receive_text()
-            if len(raw_frame.encode("utf-8")) > 65536:
-                await ws.close(code=1009, reason="message too large")
-                break
-            frame = json.loads(raw_frame)
-            if not isinstance(frame, dict):
-                continue
+            frame = json.loads(await ws.receive_text())
             if frame.get("type") != MessageKind.RPC.value:
                 continue
             request = frame.get("payload") or {}
-            if not isinstance(request, dict):
-                continue
             request_id = request.get("id", "")
-            args = request.get("args") or {}
-            if not isinstance(args, dict):
-                args = {}
             try:
                 if request.get("method") == "ping":
                     store.add_member(room.id, {**member, "connected_at": time.time()})
                     held = room.lock.current()
                     if held.holder_id == uid:
                         room.lock.renew(held.token, uid)
-                    await _refresh_presence(room)
                     result = {"ok": True, "ts": time.time()}
                 else:
                     result = await dispatch(room, uid, participant.name, request.get("method", ""),
-                                            args)
+                                            request.get("args") or {})
                 payload = {"reply_to": request_id, "ok": True, "result": result}
             except (ValueError, KeyError, SteeringError, GraphError) as exc:
                 payload = {"reply_to": request_id, "ok": False,
                            "error": {"code": getattr(exc, "code", "invalid_request"), "message": str(exc)}}
             response = Envelope.event(MessageKind.RPC_RESPONSE, room.id, payload,
                                       sender="server", seq=frame.get("seq", 0))
-            enqueue(json.dumps(response.to_dict(), default=_json_default))
+            outbox.put_nowait(json.dumps(response.to_dict(), default=_json_default))
     except WebSocketDisconnect:
         pass
     except (ValueError, json.JSONDecodeError):
@@ -527,21 +437,21 @@ async def room_socket(ws: WebSocket, room_id: str):
         if subscriber:
             room.bus.unsubscribe(f"room:{room.id}", subscriber)
             room.bus.unsubscribe(private_topic, subscriber)
-        try:
-            outbox.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
+        outbox.put_nowait(None)
         writer = room.writers.pop(ws, None)
         if writer and not writer.done():
             writer.cancel()
         room.outboxes.pop(ws, None)
         room.members.pop(connection_id, None)
         store.remove_member(room.id, connection_id)
+        for gate in store.reconcile_approvals(
+                room.id, [member.get("id") for member in _unique_members(room.id)]):
+            await broadcast(room, "approval.updated", gate, sender="server")
         current_lock = room.lock.current()
         if current_lock.holder_id == uid and not any(member.get("id") == uid for member in _unique_members(room.id)):
             room.lock.release(current_lock.token)
             await broadcast(room, "steering.lock_changed", {"lock": _safe_lock(room)}, sender=uid)
-        await _refresh_presence(room, sender=uid)
+        await broadcast(room, "room.presence", {"members": _unique_members(room.id)}, sender=uid)
 
 
 async def dispatch(room: Room, uid: str, name: str, method: str, args: dict) -> Any:
@@ -612,10 +522,7 @@ async def dispatch(room: Room, uid: str, name: str, method: str, args: dict) -> 
         return {"updated": True, "key": key}
     if method == "approval.vote":
         gate_id = str(args.get("gate_id", ""))
-        approve = args.get("approve")
-        if not isinstance(approve, bool):
-            raise ValueError("approval vote must be true or false")
-        gate = store.cast_approval_vote(gate_id, uid, name, approve,
+        gate = store.cast_approval_vote(gate_id, uid, name, bool(args.get("approve", False)),
                                         str(args.get("reason", "")),
                                         active_voters=[member.get("id") for member in _unique_members(room.id)])
         await broadcast(room, "approval.updated", gate, sender=uid)
@@ -624,38 +531,27 @@ async def dispatch(room: Room, uid: str, name: str, method: str, args: dict) -> 
         task = str(args.get("task", "")).strip()
         if not task:
             raise ValueError("task is required")
-        if len(task) > 12000:
-            raise ValueError("task must be 12,000 characters or fewer")
         if room.run_task and not room.run_task.done():
             raise ValueError("an agent run is already active")
-        # Construct the provider before acquiring the shared lease. A missing
-        # API key or invalid provider must not leave the room locked until TTL.
-        planner = _create_planner()
-        assert room.interrupt_event is not None and room.pause_event is not None
-        room.graph = store.load(room.id)
         lease = store.acquire_run(room.id)
         if lease is None:
             raise ValueError("an agent run is already active on another server")
+        assert room.interrupt_event is not None and room.pause_event is not None
         room.interrupt_event.clear()
         room.pause_event.set()
         room.run_lease_token = lease
         room.run_requested_by = uid
-        try:
-            runner = AIAgentCore(
-                room,
-                planner,
-                lambda kind, payload: asyncio.create_task(broadcast(room, kind, payload)),
-                settings.max_agent_steps,
-                settings.approval_quorum,
-                settings.approval_timeout_seconds,
-            )
-            room.run_task = asyncio.create_task(runner.run(task))
-        except Exception:
-            store.release_run(room.id, lease)
-            room.run_lease_token = None
-            room.run_requested_by = ""
-            room.run_task = None
-            raise
+        room.graph = store.load(room.id)
+        planner = _create_planner()
+        runner = AIAgentCore(
+            room,
+            planner,
+            lambda kind, payload: asyncio.create_task(broadcast(room, kind, payload)),
+            settings.max_agent_steps,
+            settings.approval_quorum,
+            settings.approval_timeout_seconds,
+        )
+        room.run_task = asyncio.create_task(runner.run(task))
         return {"started": True, "model": planner.name}
     if method == "agent.status":
         return {"state": _run_state(room), "running": store.run_is_active(room.id)}

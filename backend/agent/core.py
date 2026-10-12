@@ -159,22 +159,16 @@ class AIAgentCore:
     async def _renew_run_lease(self):
         """Keep the shared run lease alive while planning or awaiting review."""
         while True:
-            await asyncio.sleep(20)
+            await asyncio.sleep(30)
             token = self.room.run_lease_token
             if not token:
                 return
-            try:
-                renewed = await asyncio.to_thread(self.room.store.renew_run, self.room.id, token)
-            except Exception as exc:
-                renewed = False
-                reason = f"Redis lease renewal failed ({type(exc).__name__})."
-            else:
-                reason = "Agent run lost its shared lease."
+            renewed = await asyncio.to_thread(self.room.store.renew_run, self.room.id, token)
             if not renewed:
                 self.room.interrupt_event.set()
                 self.room.pause_event.set()
                 self._set_state(RunState.INTERRUPTED)
-                self.emit("agent.error", {"message": reason + " Execution stopped to prevent duplicate work."})
+                self.emit("agent.error", {"message": "Agent run lost its shared Redis lease and stopped to prevent duplicate execution."})
                 return
 
     def _set_state(self, state: RunState):

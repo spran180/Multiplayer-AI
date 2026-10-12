@@ -3,10 +3,8 @@ services:
     name: multiplayer-ai-agent
     runtime: docker
     plan: free
-    healthCheckPath: /ready
+    healthCheckPath: /health
     envVars:
-      - key: APP_ENV
-        value: production
       - key: DATABASE_PATH
         value: /tmp/state.sqlite3
       - key: REDIS_URL

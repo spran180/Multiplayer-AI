@@ -13,7 +13,6 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 
 @dataclass(frozen=True)
 class Settings:
-    app_env: str = os.getenv("APP_ENV", "development").strip().lower()
     database_path: str = os.getenv("DATABASE_PATH", "data/state.sqlite3")
     redis_url: str = os.getenv("REDIS_URL", "")
     llm_provider: str = os.getenv("LLM_PROVIDER", "auto").strip().lower()

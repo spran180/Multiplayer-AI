@@ -57,7 +57,7 @@ public enum SteeringAction: String, Codable {
 
 public enum UserRole: String, Codable {
     case viewer = "viewer"
-    case operatorRole = "operator"
+    case operator = "operator"
     case steerer = "steerer"
 }
 
@@ -67,7 +67,7 @@ public struct User: Codable, Equatable {
     public var id: String
     public var name: String
     public var role: UserRole
-    public init(id: String, name: String, role: UserRole = .operatorRole) {
+    public init(id: String, name: String, role: UserRole = .operator) {
         self.id = id; self.name = name; self.role = role
     }
 }
