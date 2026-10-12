@@ -153,19 +153,20 @@ def search_web(query: str, limit: int = 5):
                             "source": "Crossref"})
         return results
 
-    sources = (duckduckgo, wikipedia, crossref)
-    collected = []
+    sources = (("Web", duckduckgo), ("Wikipedia", wikipedia), ("Crossref", crossref))
+    collected = {}
     failures = []
     # Query independent providers concurrently so a slow source cannot delay
     # usable results from the others. Each request has its own short timeout.
     pool = ThreadPoolExecutor(max_workers=len(sources))
-    futures = [pool.submit(source) for source in sources]
+    futures = {pool.submit(source): name for name, source in sources}
     try:
         for future in as_completed(futures, timeout=7.0):
+            source_name = futures[future]
             try:
-                collected.extend(future.result())
+                collected[source_name] = future.result()
             except Exception as exc:
-                failures.append(type(exc).__name__)
+                failures.append(f"{source_name}: {type(exc).__name__}")
     except TimeoutError:
         failures.append("provider timeout")
     finally:
@@ -173,14 +174,20 @@ def search_web(query: str, limit: int = 5):
 
     results = []
     seen = set()
-    for item in collected:
-        url = item.get("url", "")
-        key = urlparse(url).netloc + urlparse(url).path
-        if url.startswith(("http://", "https://")) and key not in seen:
-            seen.add(key)
-            results.append(item)
-            if len(results) >= limit:
-                break
+    # Provider completion order is nondeterministic. Prefer actual web search
+    # results over bibliographic matches, which are especially noisy for
+    # ordinary product, company, and technology queries.
+    for source_name in ("Web", "Wikipedia", "Crossref"):
+        for item in collected.get(source_name, []):
+            url = item.get("url", "")
+            key = urlparse(url).netloc + urlparse(url).path
+            if url.startswith(("http://", "https://")) and key not in seen:
+                seen.add(key)
+                results.append(item)
+                if len(results) >= limit:
+                    break
+        if len(results) >= limit:
+            break
     if not results:
         detail = ", ".join(failures) or "all providers returned no matches"
         raise RuntimeError(f"Web search could not reach a public search source ({detail}). Check outbound internet access from the deployed server.")

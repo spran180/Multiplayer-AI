@@ -83,6 +83,11 @@ class StateStore:
         with self._lock:
             self._conn.close()
 
+    def ping(self) -> bool:
+        with self._lock:
+            self._conn.execute("SELECT 1").fetchone()
+        return True
+
     # -- rooms ----------------------------------------------------------
     def create_room(self, room_id: str, created_at: float, name: str = "Shared agent room") -> None:
         with self._lock:
@@ -344,6 +349,9 @@ def _snapshot_from_row(r: sqlite3.Row) -> Snapshot:
 class RedisStateStore:
     """Shared graph store and run lease for multiple API replicas."""
 
+    PRESENCE_TTL_SECONDS = 90
+    RUN_LEASE_TTL_SECONDS = 90
+
     def __init__(self, url: str):
         import redis
         self.client = redis.Redis.from_url(url, decode_responses=True)
@@ -355,6 +363,9 @@ class RedisStateStore:
 
     def close(self):
         self.client.close()
+
+    def ping(self) -> bool:
+        return bool(self.client.ping())
 
     def create_room(self, room_id: str, created_at: float, name: str = "Shared agent room") -> None:
         pipe = self.client.pipeline(transaction=True)
@@ -381,7 +392,9 @@ class RedisStateStore:
         connection_id = member.get("connection_id", member["id"])
         key = self._member_key(room_id, connection_id)
         pipe = self.client.pipeline(transaction=True)
-        pipe.set(key, json.dumps(member), ex=86400)
+        # Heartbeats refresh this lease. A dead browser/process must disappear
+        # promptly so approvals and control hand-offs use live participants.
+        pipe.set(key, json.dumps(member), ex=self.PRESENCE_TTL_SECONDS)
         pipe.sadd(self._members_key(room_id), connection_id)
         pipe.execute()
 
@@ -433,7 +446,7 @@ class RedisStateStore:
             pipe.set(key, json.dumps(graph.to_dict(), default=str))
             pipe.execute()
 
-    def acquire_run(self, room_id: str, ttl_seconds: int = 3600) -> Optional[str]:
+    def acquire_run(self, room_id: str, ttl_seconds: int = RUN_LEASE_TTL_SECONDS) -> Optional[str]:
         token = uuid.uuid4().hex
         acquired = self.client.set(self._room_key(room_id, "active-run"), token,
                                    nx=True, ex=ttl_seconds)
@@ -448,7 +461,7 @@ class RedisStateStore:
     def run_is_active(self, room_id: str) -> bool:
         return self.client.exists(self._room_key(room_id, "active-run")) == 1
 
-    def renew_run(self, room_id: str, token: str, ttl_seconds: int = 3600) -> bool:
+    def renew_run(self, room_id: str, token: str, ttl_seconds: int = RUN_LEASE_TTL_SECONDS) -> bool:
         return bool(self.client.eval(
             "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('EXPIRE', KEYS[1], ARGV[2]) else return 0 end",
             1, self._room_key(room_id, "active-run"), token, ttl_seconds,

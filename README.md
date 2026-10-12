@@ -73,7 +73,13 @@ The API listens on port 8000 and Compose starts Redis for shared state, accounts
 - `state.scrub` reads a historical checkpoint; `state.branch` forks from a checkpoint; `state.merge` joins two compatible branch tips.
 - Proposed side-effect tools wait for approval from connected, eligible reviewers. In solo rooms the run starter can explicitly approve; in group rooms the starter is excluded and the configured quorum is capped to the available reviewers. If reviewers disconnect while a gate is open, its quorum shrinks to the remaining eligible voters. Rejection closes the gate and timeout fails closed.
 
-Set `REDIS_URL` to enable cross-replica graphs, run leases, approvals, presence, steering locks, pub/sub events, accounts, sessions, and room membership. Without Redis, SQLite stores account and graph data for local single-instance development; presence, run coordination, and active tasks remain process-local. Use a persistent Redis-compatible service for production multi-instance deployments. The included demo tools do not access the host shell or filesystem.
+Set `REDIS_URL` to enable cross-replica graphs, run leases, approvals, presence, steering locks, pub/sub events, accounts, sessions, room membership, and authentication rate limits. Without Redis, SQLite stores account and graph data for local single-instance development; presence, run coordination, and active tasks remain process-local. The included demo tools do not access the host shell or filesystem.
+
+### Production configuration
+
+Set `APP_ENV=production` to make startup fail closed unless `REDIS_URL`, an HTTPS `PUBLIC_BASE_URL`, and a real LLM provider are configured. With `LLM_PROVIDER=auto`, this means setting `GROQ_API_KEY`; alternatively, configure `LLM_PROVIDER=ollama` with an externally reachable `OLLAMA_BASE_URL`. `/health` is a liveness endpoint and `/ready` checks the configured state services. Deploy `/ready` as the platform health check.
+
+The production deployment depends on your Redis service being configured for durable storage, access controls, TLS where supported, and backups. Redis Pub/Sub reconnects after transient disconnects; Pub/Sub itself is not a durable event log. Agent graph snapshots and account/session data are persisted in Redis, while an in-progress agent run cannot resume after its worker process is terminated. These remaining operational limits matter for critical workloads: use a durable job queue and an audited side-effect executor before connecting real production operations.
 
 For a public invite URL, set `PUBLIC_BASE_URL` to the HTTPS hostname that routes to this server. The default is local-only (`http://localhost:8000`), so copied invite links will not work for remote teammates until public DNS and HTTPS routing are configured. The macOS client can continue using its local API address on the host; teammates can use the browser invite URL.
 
