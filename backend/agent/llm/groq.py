@@ -97,9 +97,9 @@ class GroqPlanner(LLMClient):
                 {"role": "user", "content": f"Task: {task}\nStep: {step_index}\nMemory:\n{transcript}"},
             ],
         }
-        response = self._post_with_retry(httpx, body)
+        response = self._post_json_with_schema_fallback(httpx, body)
         self._raise_for_status(response)
-        raw = response.json()["choices"][0]["message"]["content"]
+        raw = self._response_content(response, "planner")
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError) as exc:
@@ -134,9 +134,9 @@ class GroqPlanner(LLMClient):
             ],
             "response_format": self._response_format("merge_result", self._MERGE_SCHEMA),
         }
-        response = self._post_with_retry(httpx, body)
+        response = self._post_json_with_schema_fallback(httpx, body)
         self._raise_for_status(response)
-        content = response.json()["choices"][0]["message"]["content"]
+        content = self._response_content(response, "merge")
         try:
             data = json.loads(content)
         except (json.JSONDecodeError, TypeError) as exc:
@@ -161,7 +161,10 @@ class GroqPlanner(LLMClient):
                 message = str(error.get("message") or "")
                 failed_generation = error.get("failed_generation")
                 if failed_generation:
-                    message += f"; failed_generation={json.dumps(failed_generation, ensure_ascii=False)}"
+                    generated = json.dumps(failed_generation, ensure_ascii=False)
+                    message += f"; failed_generation={generated[:500]}"
+                    if len(generated) > 500:
+                        message += "… (truncated)"
         except (ValueError, TypeError):
             pass
 
@@ -172,15 +175,88 @@ class GroqPlanner(LLMClient):
             f"Groq rejected the request (HTTP {response.status_code}){detail}"
         )
 
+    def _post_json_with_schema_fallback(self, httpx, body):
+        """Retry schema-constrained JSON failures in Groq's simpler JSON mode.
+
+        Groq/model combinations can occasionally reject a generated response even
+        when the request schema is valid. JSON Object Mode still guarantees JSON
+        syntax, while our parser below validates and normalizes the app-level
+        response. Only retry this specific generation-validation failure; other
+        4xx responses should retain their original actionable error.
+        """
+        response = self._post_with_retry(httpx, body)
+        if not self._is_schema_generation_error(response, body):
+            return response
+
+        response.close()
+        fallback_body = dict(body)
+        fallback_body["response_format"] = {"type": "json_object"}
+        fallback = self._post_with_retry(httpx, fallback_body)
+        if not fallback.is_success:
+            try:
+                self._raise_for_status(fallback)
+            except RuntimeError as exc:
+                fallback.close()
+                raise RuntimeError(
+                    f"Groq could not produce a schema-valid response for model {self.model}; "
+                    f"retrying once in JSON Object Mode also failed: {exc}"
+                ) from exc
+        return fallback
+
+    @staticmethod
+    def _is_schema_generation_error(response, body: dict) -> bool:
+        if response.status_code != 400:
+            return False
+        response_format = body.get("response_format", {})
+        if response_format.get("type") != "json_schema":
+            return False
+        try:
+            payload = response.json()
+            error = payload.get("error", {}) if isinstance(payload, dict) else {}
+            message = str(error.get("message", "")).lower() if isinstance(error, dict) else ""
+            return "failed to validate json" in message or bool(
+                isinstance(error, dict) and error.get("failed_generation")
+            )
+        except (ValueError, TypeError):
+            return False
+
+    def _response_content(self, response, operation: str) -> str:
+        """Validate Groq's envelope before parsing the generated JSON body."""
+        try:
+            payload = response.json()
+            content = payload["choices"][0]["message"]["content"]
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            raise RuntimeError(
+                f"Groq returned an incomplete {operation} response for model {self.model}; "
+                "the response did not contain choices[0].message.content."
+            ) from exc
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError(
+                f"Groq returned an empty {operation} response for model {self.model}. "
+                "The model may have stopped before producing JSON."
+            )
+        return content
+
     def _post_with_retry(self, httpx, body):
         """Retry transient provider limits/outages, honoring Groq's Retry-After."""
         headers = {"Authorization": f"Bearer {self.api_key}"}
         retryable = {429, 500, 502, 503, 504}
         for attempt in range(4):
-            response = httpx.post(
-                "https://api.groq.com/openai/v1/chat/completions", json=body,
-                headers=headers, timeout=self.timeout,
-            )
+            try:
+                response = httpx.post(
+                    "https://api.groq.com/openai/v1/chat/completions", json=body,
+                    headers=headers, timeout=self.timeout,
+                )
+            except httpx.TimeoutException as exc:
+                raise RuntimeError(
+                    f"Groq request timed out after {self.timeout:g}s for model {self.model}. "
+                    "Retry the run or increase the planner timeout."
+                ) from exc
+            except httpx.RequestError as exc:
+                raise RuntimeError(
+                    f"Could not reach Groq for model {self.model}: {exc}. "
+                    "Check server network access and the Groq API status."
+                ) from exc
             if response.status_code not in retryable:
                 return response
 
