@@ -6,3 +6,4 @@ data/
 frontend/.build/
 frontend/.swiftpm/
 .DS_Store
+Report.md
